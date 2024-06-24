@@ -1,0 +1,168 @@
+name: Upgrade Network Equipment - Hostscope
+on:
+  workflow_dispatch:
+    inputs:
+      RUNNER:
+        type: choice
+        description: 'Which runner should we run on?'
+        required: true
+        options: 
+        - 3rt
+        - 3rttest
+      BIN_FILE:
+        description: 'What is the name of the upgrade bin file?'
+        required: true
+      DEVICE_TYPE:
+        type: choice
+        description: 'Identifies the type of device to upgrade'
+        required: true
+        options: 
+        - '9300'
+        - '3750'
+        - '3750X'
+        - '3850'
+        - '93180'
+        - '2960'
+        - '4331'
+        - '9500'
+
+jobs:
+  kickoff-lynxx-agent:
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    outputs:
+      HOSTSCOPE: ${{ steps.set_hostscope.outputs.hostscope }}
+    steps: 
+      - name: Set HostScope
+        id: set_hostscope
+        run: |
+          echo "HOSTSCOPE=${{ github.event.inputs.RUNNER }}-${{ github.event.inputs.DEVICE_TYPE }}" >> $GITHUB_ENV
+          echo "::set-output name=hostscope::${{ github.event.inputs.RUNNER }}-${{ github.event.inputs.DEVICE_TYPE }}"
+      - name: Check out repository code
+        uses: actions/checkout@v3
+      - run: |
+         echo "HostScope: ${{ env.HOSTSCOPE }}"
+         docker-compose -f docker/ContainerSetup/lynxx-agent/docker-compose.yml up -d
+
+  start-http-server:
+    needs: [kickoff-lynxx-agent]
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    steps:
+      - run: |
+         echo "HostScope: ${{ needs.kickoff-lynxx-agent.outputs.HOSTSCOPE }}"
+         echo "RUNNER_NAME=${{ github.event.inputs.RUNNER }}" > packer/http-server/.env
+         ls -la packer/http-server/
+         cat packer/http-server/.env
+         chmod -R 777 packer/
+         docker-compose -f ansible/Networking/http-server/docker-compose.yml up -d
+        
+        
+        
+  Config-Ansible:
+    needs: [kickoff-lynxx-agent, start-http-server]
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    steps: 
+     - run: |
+        docker exec lynxx-agent bash -c "mkdir -p /etc/ansible/"
+        docker exec lynxx-agent bash -c "export ANSIBLE_HOST_KEY_CHECKING=False && cp /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/hostfiles/ansible.cfg /etc/ansible/ansible.cfg"   
+          
+  Pull-Upgrade-Bin:
+    needs: [kickoff-lynxx-agent, Config-Ansible]
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    steps:
+     - name: Download and get filename
+       id: get_filename
+       run: |
+         docker exec lynxx-agent bash -c 'mkdir -p /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/http-server/ && curl -u ${{ secrets.REPO_USER }}:${{ secrets.REPO_PASS }} https://nexus.3rtnetworks.com/cisco-firmware/${{ github.event.inputs.DEVICE_TYPE }}/${{ github.event.inputs.BIN_FILE }} --output /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/http-server/${{ github.event.inputs.BIN_FILE }}'
+         docker exec lynxx-agent bash -c 'ls /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/http-server/'
+         FILES=$(docker exec lynxx-agent bash -c 'ls /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/http-server/')
+         FILE_COUNT=$(echo "$FILES" | wc -l)
+         if [ "$FILE_COUNT" -ne 2 ]; then
+            echo "More than one file in /upgrades directory: $FILE_COUNT. Fix your specified bin folder in the repo!"
+            exit 1
+         fi
+         echo "FILENAME=$FILES"
+         echo "::set-output name=filename::$FILES"
+         docker exec lynxx-agent bash -c 'chmod 777 /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/http-server/${{ github.event.inputs.BIN_FILE }}'
+         docker exec lynxx-agent bash -c 'ls -la /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/http-server/${{ github.event.inputs.BIN_FILE }}'
+
+  Verify-SCP-Enable:
+    needs: [kickoff-lynxx-agent, Config-Ansible]
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    steps:
+     - name: Import Secrets
+       uses: hashicorp/vault-action@v2
+       with:
+         url: https://vault.3rtnetworks.com
+         method: github
+         githubToken: ${{ secrets.VAULT_GITHUB_PAT }}
+         secrets: |
+          secrets/data/secrets/network/${{ github.event.inputs.RUNNER }} device_password | DEVICE_PASSWORD ;
+          secrets/data/secrets/network/${{ github.event.inputs.RUNNER }} device_username | DEVICE_USERNAME ;
+          secrets/data/secrets/docker/${{ github.event.inputs.RUNNER }} docker-ip | DOCKER_IP ;
+
+     - name: Ensure Dependencies are Installed
+       run: |
+         docker exec lynxx-agent bash -c "source /opt/venv/bin/activate && pip install ansible paramiko ansible-pylibssh"
+      
+     - name: Create Environment File on Docker Container
+       run: |
+         docker exec lynxx-agent bash -c "echo 'ANSIBLE_NET_USERNAME=${DEVICE_USERNAME}' > /tmp/ansible_env.sh"
+         docker exec lynxx-agent bash -c "echo 'ANSIBLE_NET_PASSWORD=${DEVICE_PASSWORD}' >> /tmp/ansible_env.sh"
+
+
+    #  - name: Download and get filename
+    #    id: get_filename
+    #    run: |
+    #      docker exec lynxx-agent bash -c "source /opt/venv/bin/activate && ANSIBLE_USERNAME=${DEVICE_USERNAME} ANSIBLE_PASSWORD=${DEVICE_PASSWORD} ansible-playbook /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/enable-scp.yml -i '${{ github.event.inputs.DEVICE_NAME }},' --extra-vars 'ANSIBLE_HOST_KEY_CHECKING=False ansible_connection=network_cli ansible_network_os=ios ansible_ssh_user=${DEVICE_USERNAME} ansible_ssh_pass=${DEVICE_PASSWORD} ansible_become_password=${DEVICE_PASSWORD}'"
+  
+  Upgrade-Device:
+    needs: [kickoff-lynxx-agent, Config-Ansible, Pull-Upgrade-Bin, Verify-SCP-Enable]
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    steps:
+      - name: Ensure Dependencies are Installed
+        run: |
+          docker exec lynxx-agent bash -c "source /opt/venv/bin/activate && pip install ansible paramiko ansible-pylibssh"
+
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v2
+        with:
+          url: https://vault.3rtnetworks.com
+          method: github
+          githubToken: ${{ secrets.VAULT_GITHUB_PAT }}
+          secrets: |
+            secrets/data/secrets/network/${{ github.event.inputs.RUNNER }} device_password | DEVICE_PASSWORD ;
+            secrets/data/secrets/network/${{ github.event.inputs.RUNNER }} device_username | DEVICE_USERNAME ;
+            secrets/data/secrets/docker/${{ github.event.inputs.RUNNER }} docker-ip | DOCKER_IP ;
+
+      - name: Run Upgrade
+        run: |
+         echo "HostScope: ${{ needs.kickoff-lynxx-agent.outputs.HOSTSCOPE }}"
+         docker exec lynxx-agent bash -c "mkdir -p /backups"
+         docker exec lynxx-agent bash -c "mkdir -p /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/network-backups"
+         docker exec lynxx-agent bash -c "source /opt/venv/bin/activate && ANSIBLE_USERNAME=${DEVICE_USERNAME} DOCKER_IP=${DOCKER_IP} ANSIBLE_PASSWORD=${DEVICE_PASSWORD} ansible-playbook /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/Networking/upgrade_host.yml -i /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/ansible/hostfiles/hosts --extra-vars 'ANSIBLE_HOST_KEY_CHECKING=False http_server=${DOCKER_IP} HOSTSCOPE='\''${{ needs.kickoff-lynxx-agent.outputs.HOSTSCOPE }}'\'' target_version='\''${{ github.event.inputs.BIN_FILE }}'\'' model='\''${{ github.event.inputs.DEVICE_TYPE }}'\'' upgrade_bin=${{ steps.get_filename.outputs.filename }} ansible_network_os=ios ansible_ssh_user=${DEVICE_USERNAME} ansible_ssh_pass=${DEVICE_PASSWORD} ansible_become_password=${DEVICE_PASSWORD}' "
+        continue-on-error: true
+
+      - name: wait for Tar
+        run: |
+         sleep 15
+        
+      - name: Tar Backup files
+        run: |
+         docker exec lynxx-agent bash -c "tar -czvf /backups/network-backups.tar.gz -C /backups ."
+         docker exec lynxx-agent bash -c "cp /backups/network-backups.tar.gz /repo/${{ github.event.inputs.RUNNER }}-runner/Lynxx-Networks/Lynxx-Networks/network-backups/"
+
+      
+      - name: Archive Network Backups
+        uses: actions/upload-artifact@v3
+        with:
+          name: Network Backups
+          path: network-backups/network-backups.tar.gz
+
+  shutdown-lynxx-agent:
+    needs: [kickoff-lynxx-agent, Upgrade-Device]
+    runs-on: ${{ github.event.inputs.RUNNER }}-runner
+    if: always()
+    steps:
+     - run: |
+        docker-compose -f ansible/Networking/http-server/docker-compose.yml down
+        docker-compose -f docker/ContainerSetup/lynxx-agent/docker-compose.yml down

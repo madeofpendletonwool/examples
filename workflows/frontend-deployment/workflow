@@ -1,0 +1,185 @@
+name: Deploy Azure Frontend
+
+on:
+  workflow_dispatch:
+
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        env:
+          BASTION_IP: '' # We'll set this dynamically
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
+
+            - uses: hashicorp/setup-terraform@v3
+
+            - uses: azure/login@v1
+              with:
+                creds: ${{ secrets.AZURE_CREDENTIALS }}
+            
+            - name: Initialize Terraform
+              run: |
+                # sh
+                export ARM_CLIENT_ID=${{ secrets.TF_ARM_CLIENT_ID }}
+                export ARM_CLIENT_SECRET=${{ secrets.TF_ARM_CLIENT_SECRET }}
+                export ARM_TENANT_ID=${{ secrets.TF_ARM_TENANT_ID }}
+                export ARM_SUBSCRIPTION_ID=${{ secrets.TF_ARM_SUBSCRIPTION_ID }}
+                # export ARM_ACCESS_KEY=${{ secrets.TF_ARM_ACCESS_KEY }}
+                cd Terraform/Azure/frontend # Adjust if your Terraform files are in a different subdirectory
+                terraform init
+
+            - name: Validate Terraform Configuration
+              run: |
+                cd Terraform/Azure/frontend
+                terraform validate
+
+
+
+            - name: Create terraform.tfvars
+              run: |
+                cd Terraform/Azure/frontend
+                echo "admin_username = \"${{ secrets.AZURE_FE_USERNAME }}\"" > terraform.tfvars
+                echo "admin_password = \"${{ secrets.AZURE_FE_PASSWORD }}\"" >> terraform.tfvars
+
+            - name: Append pub and priv SSH keys to terraform.tfvars
+              run: |
+                cd Terraform/Azure/frontend
+                echo "public_key = \"${{ secrets.NGINX_PUBLIC_KEY }}\"" >> terraform.tfvars
+                echo "private_key = \"${{ secrets.NGINX_PRIVATE_KEY }}\"" >> terraform.tfvars
+
+
+            - name: Append Bastion SSH keys to terraform.tfvars
+              run: |
+                cd Terraform/Azure/frontend
+                echo "bastion_public_key = \"${{ secrets.BASTION_PUBLIC_KEY }}\"" >> terraform.tfvars
+
+            - name: Upload vars to check
+              uses: actions/upload-artifact@v2
+              with:
+                name: tfvars
+                path: Terraform/Azure/frontend/terraform.tfvars
+
+            # - name: Prepare SSH Key File
+            #   run: |
+            #     mkdir -p ~/.ssh
+            #     echo "${{ secrets.BASTION_PUBLIC_KEY }}" > ~/.ssh/id_rsa.pub
+            #     echo "bastion_ssh_key_file = \"~/.ssh/id_rsa.pub\"" >> terraform.tfvars
+            #   shell: bash
+            
+
+              
+            - name: Terraform Plan
+              run: |
+                export ARM_CLIENT_ID=${{ secrets.TF_ARM_CLIENT_ID }}
+                export ARM_CLIENT_SECRET=${{ secrets.TF_ARM_CLIENT_SECRET }}
+                export ARM_TENANT_ID=${{ secrets.TF_ARM_TENANT_ID }}
+                export ARM_SUBSCRIPTION_ID=${{ secrets.TF_ARM_SUBSCRIPTION_ID }}
+                ssh-keygen -t rsa -b 4096 -f /home/$USER/.ssh/id_rsa -q -N ""
+                cd Terraform/Azure/frontend
+                echo "creating plan..."
+                terraform plan -out=frontend.tfplan
+                terraform show -no-color frontend.tfplan > readable-frontend-plan.txt
+
+            - name: Upload Terraform Plan
+              uses: actions/upload-artifact@v2
+              with:
+                name: frontend
+                path: Terraform/Azure/frontend/frontend.tfplan
+
+            - name: Upload readable Terraform Plan
+              uses: actions/upload-artifact@v2
+              with:
+                name: frontend-readable
+                path: Terraform/Azure/frontend/readable-frontend-plan.txt
+
+            - name: Ensure Bastion Host is Running
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                set +e  # Disable immediate exit from script if any command fails
+                VM_EXISTS=$(az vm show --name bastion-host-vmLinux-0 --resource-group web-frontend --query "id" -o tsv)
+                set -e  # Re-enable immediate exit for subsequent commands
+                if [ -z "$VM_EXISTS" ]; then
+                  echo "Bastion host does not exist, Terraform will create it."
+                else
+                  VM_STATE=$(az vm get-instance-view --name bastion-host-vmLinux-0 --resource-group web-frontend --query "instanceView.statuses[?code=='PowerState/running']" | jq -r '.[].code')
+                  if [ "$VM_STATE" != "PowerState/running" ]; then
+                    echo "Starting bastion-host-vmLinux-0..."
+                    az vm start --name bastion-host-vmLinux-0 --resource-group web-frontend
+                  else
+                    echo "Bastion host is already running."
+                  fi
+                fi
+              shell: bash
+
+
+            - name: Terraform Apply
+              run: |
+                export ARM_CLIENT_ID=${{ secrets.TF_ARM_CLIENT_ID }}
+                export ARM_CLIENT_SECRET=${{ secrets.TF_ARM_CLIENT_SECRET }}
+                export ARM_TENANT_ID=${{ secrets.TF_ARM_TENANT_ID }}
+                export ARM_SUBSCRIPTION_ID=${{ secrets.TF_ARM_SUBSCRIPTION_ID }}
+                cd Terraform/Azure/frontend
+                terraform apply "frontend.tfplan" | tee apply_output.txt
+                terraform plan -no-color | tee post_apply_plan.txt
+                terraform show -no-color > post_apply_state.txt
+          
+            - name: Upload Terraform Apply Output
+              uses: actions/upload-artifact@v2
+              with:
+                name: apply-output
+                path: Terraform/Azure/frontend/apply_output.txt
+            
+            - name: Upload Post-Apply Plan
+              uses: actions/upload-artifact@v2
+              with:
+                name: post-apply-plan
+                path: Terraform/Azure/frontend/post_apply_plan.txt
+            
+            - name: Upload Post-Apply State
+              uses: actions/upload-artifact@v2
+              with:
+                name: post-apply-state
+                path: Terraform/Azure/frontend/post_apply_state.txt
+
+            - name: Setup SSH Key
+              run: |
+                echo "${{ secrets.BASTION_PRIVATE_KEY }}" | base64 --decode > bastion_key.pem
+                chmod 600 bastion_key.pem
+            
+            - name: Get Bastion Host IP
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                BASTION_IP=$(az vm show --name bastion-host-vmLinux-0 --resource-group web-frontend --show-details --query publicIps -o tsv)
+                echo "BASTION_IP=${BASTION_IP}" >> $GITHUB_ENV
+
+            # steps to ssh to bastion host and run domain add script
+            - name: Transfer Frontend Configuration and Script
+              run: |
+                chmod +x Terraform/Azure/frontend/rebuild-frontend.sh
+                scp -o StrictHostKeyChecking=no -i bastion_key.pem Terraform/Azure/frontend/rebuild-frontend.sh threert@${{ env.BASTION_IP }}:/home/threert/rebuild-frontend.sh
+                scp -o StrictHostKeyChecking=no -i bastion_key.pem Terraform/Azure/frontend/frontend.json threert@${{ env.BASTION_IP }}:/home/threert/frontend.json             
+        
+            - name: Transfer Frontend Configuration to Nginx Server
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} \
+                "scp -o StrictHostKeyChecking=no /home/threert/frontend.json threert@ft-nginx-0:/home/threert/frontend.json"
+            
+
+            - name: Rebuild Frontend Configuration
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} \
+                "ssh -o StrictHostKeyChecking=no threert@ft-nginx-0 'bash -s' < /home/threert/rebuild-frontend.sh"
+
+            - name: Restart Nginx Services
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh threert@ft-nginx-0 'sudo systemctl restart nginx'"  
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh threert@ft-nginx-1 'sudo systemctl restart nginx'"  
+  
+  
+            
+            - name: Deallocate Bastion Host VM
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                az vm deallocate --resource-group web-frontend --name bastion-host-vmLinux-0

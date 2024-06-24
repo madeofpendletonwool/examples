@@ -1,0 +1,168 @@
+---
+
+- name: Cisco Upgrade Equipment
+  hosts: '{{ HOSTSCOPE }}'
+  connection: network_cli
+  become: yes
+  become_method: enable
+
+  vars: 
+    upgrade_ios_version: '{{ target_version }}'
+    upgrade_bin: '{{ filename }}'
+    model: '{{ ansible_net_model }}'
+  tasks:
+    - name: CHECK CURRENT VERSION
+      ios_facts:
+      ignore_unreachable: true
+      ignore_errors: true
+      register: initial_facts
+    - name: DEBUG ALL FACTS
+      debug: 
+        var: initial_facts
+    - debug: 
+        msg: 
+          - "Current version is {{ initial_facts.ansible_facts.ansible_net_version }}"
+    - debug: 
+        msg: 
+          - "model is: {{ model }}"
+
+
+# - name: Localhost Tasks
+#   hosts: localhost
+#   connection: local
+
+ 
+#   tasks:
+#    - name: Get ansible date/time facts
+#      setup:
+#        filter: "ansible_date_time"
+#        gather_subset: "!all"
+ 
+#    - name: Store DTG as fact
+#      set_fact:
+#        DTG: "{{ ansible_date_time.date }}"
+ 
+#    - name: Create Directory {{hostvars.localhost.DTG}}
+#      file:
+#       path: /backups/{{hostvars.localhost.DTG}}
+#       state: directory
+#   run_once: true
+
+- name: Cisco Bring it all together
+  hosts: '{{ HOSTSCOPE }}'
+  connection: network_cli
+  become: yes
+  become_method: enable
+ 
+  tasks:
+   - name: Backup Running Config  
+     ios_command:
+       commands: show run  
+     register: config
+ 
+   - name: Save output to /backups/
+     copy:
+       content: "{{config.stdout[0]}}"
+       dest: "/backups/{{ inventory_hostname }}-config.txt"
+ 
+   - name: Save running config 
+     ios_config:
+       save_when: always
+
+  #  - name: Copy Image // This could take up to 4 minutes
+  #    net_put:
+  #      src: "/upgrades/upgrade.bin"
+  #      protocol: scp
+  #      dest: "flash:upgrade.bin"
+  #    vars:
+  #      ansible_command_timeout: 1600
+
+   - name: Set the command
+     set_fact:
+       copy_command: "copy http://{{ http_server }}:5000/{{ target_version }} flash:{{ target_version }}"
+
+   - name: Debug the constructed command
+     debug:
+       msg: "{{ copy_command }}"
+
+   - name: Copy image via HTTP
+     ios_command:
+       commands:
+         - command: "{{ copy_command }}"
+           prompt: "Destination filename \\[{{ target_version }}\\]?"
+           answer: "\r"
+     vars:
+       ansible_command_timeout: 1600
+
+   - name: Run verify flash commands
+     ios_command:
+       commands:
+         - "verify flash:{{ target_version }}"
+     when: model == '9300' or model == '9200' or model == '9500' or model == '3850'
+
+   - name: Run packages commands
+     ios_config:
+       commands:
+         - "no boot system"
+         - "boot system flash:packages.config"
+         - "no boot manual"
+       save_when: always
+     when: model == '9300' or model == '9200' or model == '9500' or model == '3850'
+
+   - name: memming
+     ios_command:
+       commands:
+         - "wr mem"
+         - "install add file flash:{{ target_version }} activate commit"     
+       timeout: 600
+     when: model == '9300' or model == '9200' or model == '9500' or model == '3850'
+
+   - name: Run boot system commands
+     ios_config:
+       commands:
+         - "boot system flash:{{ target_version }}"
+       save_when: always
+     when: model == '3750' or model == '3750X' or model == '4331'
+
+   - name: Change Nexus commands
+     ios_config:
+       commands:
+         - "install all nxos bootflash:{{ target_version }}"
+       save_when: always
+     when: model == '93180'
+
+   - name: Reload the Device 
+     cli_command:
+       command: reload
+       prompt:
+         - confirm
+       answer:
+         - 'y'
+     when: model == '3750' or model == '3750X' or model == '4331'
+
+   - name: Wait for device to come back online
+     wait_for:
+       host: "{{ inventory_hostname }}"
+       port: 22
+       delay: 100
+       timeout: 2700  # waits up to 600 seconds in total (including the initial delay)
+     delegate_to: localhost
+
+   - name: CHECK NEW VERSION AFTER RELOAD
+     ios_facts:
+     ignore_unreachable: true
+     ignore_errors: true
+     register: new_facts
+
+   - debug:
+       msg:
+         - "New version is {{ new_facts.ansible_facts.ansible_net_version }}"
+  
+   - name: ASSERT THAT THE IOS VERSION HAS CHANGED
+     assert:
+       that:
+         - initial_facts.ansible_facts.ansible_net_version != new_facts.ansible_facts.ansible_net_version
+  
+   - debug:
+       msg:
+         - "Software Upgrade has been completed"

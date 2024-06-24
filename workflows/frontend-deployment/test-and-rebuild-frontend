@@ -1,0 +1,231 @@
+name: Test and Rebuild Azure Infra
+
+on:
+  schedule:
+    - cron: '45 */12 * * *'
+
+  workflow_dispatch:
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        env:
+          BASTION_IP: '' # We'll set this dynamically
+          VM0_STATUS: ''
+          VM1_STATUS: ''
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v3
+
+            - uses: hashicorp/setup-terraform@v3
+
+            - uses: azure/login@v1
+              with:
+                creds: ${{ secrets.AZURE_CREDENTIALS }}
+            
+            - name: Initialize Terraform
+              run: |
+                # sh
+                export ARM_CLIENT_ID=${{ secrets.TF_ARM_CLIENT_ID }}
+                export ARM_CLIENT_SECRET=${{ secrets.TF_ARM_CLIENT_SECRET }}
+                export ARM_TENANT_ID=${{ secrets.TF_ARM_TENANT_ID }}
+                export ARM_SUBSCRIPTION_ID=${{ secrets.TF_ARM_SUBSCRIPTION_ID }}
+                # export ARM_ACCESS_KEY=${{ secrets.TF_ARM_ACCESS_KEY }}
+                cd Terraform/Azure/frontend # Adjust if your Terraform files are in a different subdirectory
+                terraform init
+
+            - name: Validate Terraform Configuration
+              run: |
+                cd Terraform/Azure/frontend
+                terraform validate
+
+
+
+            - name: Create terraform.tfvars
+              run: |
+                cd Terraform/Azure/frontend
+                echo "admin_username = \"${{ secrets.AZURE_FE_USERNAME }}\"" > terraform.tfvars
+                echo "admin_password = \"${{ secrets.AZURE_FE_PASSWORD }}\"" >> terraform.tfvars
+
+            - name: Append pub and priv SSH keys to terraform.tfvars
+              run: |
+                cd Terraform/Azure/frontend
+                echo "public_key = \"${{ secrets.NGINX_PUBLIC_KEY }}\"" >> terraform.tfvars
+                echo "private_key = \"${{ secrets.NGINX_PRIVATE_KEY }}\"" >> terraform.tfvars
+
+
+            - name: Append Bastion SSH keys to terraform.tfvars
+              run: |
+                cd Terraform/Azure/frontend
+                echo "bastion_public_key = \"${{ secrets.BASTION_PUBLIC_KEY }}\"" >> terraform.tfvars
+
+            - name: Setup SSH Key
+              run: |
+                echo "${{ secrets.BASTION_PRIVATE_KEY }}" | base64 --decode > bastion_key.pem
+                chmod 600 bastion_key.pem
+
+            - name: Ensure Bastion Host is Running
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                set +e  # Disable immediate exit from script if any command fails
+                VM_EXISTS=$(az vm show --name bastion-host-vmLinux-0 --resource-group web-frontend --query "id" -o tsv)
+                set -e  # Re-enable immediate exit for subsequent commands
+                if [ -z "$VM_EXISTS" ]; then
+                echo "Bastion host does not exist, Terraform will create it."
+                else
+                VM_STATE=$(az vm get-instance-view --name bastion-host-vmLinux-0 --resource-group web-frontend --query "instanceView.statuses[?code=='PowerState/running']" | jq -r '.[].code')
+                if [ "$VM_STATE" != "PowerState/running" ]; then
+                    echo "Starting bastion-host-vmLinux-0..."
+                    az vm start --name bastion-host-vmLinux-0 --resource-group web-frontend
+                else
+                    echo "Bastion host is already running."
+                fi
+                fi
+              shell: bash
+
+            - name: Ensure nginx1 Host is Running
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                set +e  # Disable immediate exit from script if any command fails
+                VM_EXISTS=$(az vm show --name ft-nginx-vmLinux-1 --resource-group web-frontend --query "id" -o tsv)
+                set -e  # Re-enable immediate exit for subsequent commands
+                if [ -z "$VM_EXISTS" ]; then
+                echo "nginx host does not exist, Terraform will create it."
+                else
+                VM_STATE=$(az vm get-instance-view --name ft-nginx-vmLinux-1 --resource-group web-frontend --query "instanceView.statuses[?code=='PowerState/running']" | jq -r '.[].code')
+                if [ "$VM_STATE" != "PowerState/running" ]; then
+                    echo "Starting ft-nginx-vmLinux-1..."
+                    az vm start --name ft-nginx-vmLinux-1 --resource-group web-frontend
+                else
+                    echo "nginx host is already running."
+                fi
+                fi
+              shell: bash
+
+            - name: Ensure nginx0 Host is Running
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                set +e  # Disable immediate exit from script if any command fails
+                VM_EXISTS=$(az vm show --name ft-nginx-vmLinux-0 --resource-group web-frontend --query "id" -o tsv)
+                set -e  # Re-enable immediate exit for subsequent commands
+                if [ -z "$VM_EXISTS" ]; then
+                echo "nginx host does not exist, Terraform will create it."
+                else
+                VM_STATE=$(az vm get-instance-view --name ft-nginx-vmLinux-0 --resource-group web-frontend --query "instanceView.statuses[?code=='PowerState/running']" | jq -r '.[].code')
+                if [ "$VM_STATE" != "PowerState/running" ]; then
+                    echo "Starting ft-nginx-vmLinux-0..."
+                    az vm start --name ft-nginx-vmLinux-0 --resource-group web-frontend
+                else
+                    echo "nginx host is already running."
+                fi
+                fi
+              shell: bash
+            
+            - name: Get Bastion Host IP
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                BASTION_IP=$(az vm show --name bastion-host-vmLinux-0 --resource-group web-frontend --show-details --query publicIps -o tsv)
+                echo "BASTION_IP=${BASTION_IP}" >> $GITHUB_ENV
+
+            - name: Setup SSH Key
+              run: |
+                echo "${{ secrets.BASTION_PRIVATE_KEY }}" | base64 --decode > bastion_key.pem
+                chmod 600 bastion_key.pem
+              
+
+            - name: Check ft-nginx-0 Health
+              id: check_nginx_0
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} \
+                'echo Checking ft-nginx-0 health...
+                  response=$(curl -s http://ft-nginx-0/jsdFI83fH8723)
+                  if [ "$response" != "ok" ]; then
+                    echo ft-nginx-0 is unhealthy
+                    echo "::set-output name=VM0_STATUS::unhealthy"
+                  else
+                    echo ft-nginx-0 is healthy
+                    echo "::set-output name=VM0_STATUS::healthy"
+                  fi'
+                echo "VM0_STATUS=${{ steps.check_nginx_0.outputs.VM0_STATUS }}" >> $GITHUB_ENV
+            
+
+            - name: Taint and Rebuild Unhealthy VM 0
+              if: steps.check_nginx_0.outputs.VM0_STATUS == 'unhealthy'
+              run: |
+                export ARM_CLIENT_ID=${{ secrets.TF_ARM_CLIENT_ID }}
+                export ARM_CLIENT_SECRET=${{ secrets.TF_ARM_CLIENT_SECRET }}
+                export ARM_TENANT_ID=${{ secrets.TF_ARM_TENANT_ID }}
+                export ARM_SUBSCRIPTION_ID=${{ secrets.TF_ARM_SUBSCRIPTION_ID }}
+                cd Terraform/Azure/frontend
+                terraform taint azurerm_linux_virtual_machine.vm[0]
+                terraform apply -auto-approve
+                terraform plan -no-color | tee post_apply_plan.txt
+                terraform show -no-color > post_apply_state.txt
+
+            - name: Pull Certs from VM 1
+              if: steps.check_nginx_0.outputs.VM0_STATUS == 'unhealthy'
+              run: |        
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh -o StrictHostKeyChecking=no threert@ft-nginx-1 'sudo rm -rf /root/.ssh/known_hosts && sudo /home/threert/sync_certs_to_primary.sh'"
+
+            - name: Restart Nginx Services
+              if: steps.check_nginx_0.outputs.VM0_STATUS == 'unhealthy'
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh -o StrictHostKeyChecking=no threert@ft-nginx-0 'sudo systemctl restart nginx'"  
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh -o StrictHostKeyChecking=no threert@ft-nginx-1 'sudo systemctl restart nginx'"
+
+    
+            - name: Check ft-nginx-1 Health
+              id: check_nginx_1
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} \
+                'echo Checking ft-nginx-1 health...
+                  response=$(curl -s http://ft-nginx-1/jsdFI83fH8723)
+                  if [ "$response" != "ok" ]; then
+                    echo ft-nginx-1 is unhealthy
+                    echo "::set-output name=VM1_STATUS::unhealthy"
+                  else
+                    echo ft-nginx-1 is healthy
+                    echo "::set-output name=VM1_STATUS::healthy"
+                  fi'
+                echo "VM1_STATUS=${{ steps.check_nginx_1.outputs.VM1_STATUS }}" >> $GITHUB_ENV
+
+            - name: Print VM1_STATUS
+              run: |
+                echo "VM1_STATUS=${{ env.VM1_STATUS }}"
+
+            - name: Debug VM1_STATUS output
+              run: |
+                echo "VM1_STATUS from step output = ${{ steps.check_nginx_1.outputs.VM1_STATUS }}"
+            
+    
+
+            - name: Taint and Rebuild Unhealthy VM 1
+              if: steps.check_nginx_1.outputs.VM1_STATUS == 'unhealthy'
+              run: |
+                ssh-keygen -t rsa -b 4096 -f /home/$USER/.ssh/id_rsa -q -N ""
+                export ARM_CLIENT_ID=${{ secrets.TF_ARM_CLIENT_ID }}
+                export ARM_CLIENT_SECRET=${{ secrets.TF_ARM_CLIENT_SECRET }}
+                export ARM_TENANT_ID=${{ secrets.TF_ARM_TENANT_ID }}
+                export ARM_SUBSCRIPTION_ID=${{ secrets.TF_ARM_SUBSCRIPTION_ID }}
+                cd Terraform/Azure/frontend
+                terraform taint module.vm.azurerm_virtual_machine.vm_linux[1]
+                terraform taint azurerm_virtual_machine_extension.vm_nginx_secondary_setup_combined
+                terraform apply -auto-approve
+                terraform plan -no-color | tee post_apply_plan.txt
+                terraform show -no-color > post_apply_state.txt
+
+            - name: Pull Certs from VM 0
+              if: steps.check_nginx_1.outputs.VM1_STATUS == 'unhealthy'
+              run: |        
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh -o StrictHostKeyChecking=no threert@ft-nginx-0 'sudo rm -rf /root/.ssh/known_hosts && sudo /home/threert/sync_certs_to_secondary.sh'"
+
+            - name: Restart Nginx Services
+              if: steps.check_nginx_1.outputs.VM1_STATUS == 'unhealthy'
+              run: |
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh -o StrictHostKeyChecking=no threert@ft-nginx-0 'sudo systemctl restart nginx'"  
+                ssh -o StrictHostKeyChecking=no -i bastion_key.pem threert@${{ env.BASTION_IP }} "ssh -o StrictHostKeyChecking=no threert@ft-nginx-1 'sudo systemctl restart nginx'"
+
+            - name: Deallocate Bastion Host VM
+              run: |
+                az login --service-principal -u ${{ secrets.TF_ARM_CLIENT_ID }} -p ${{ secrets.TF_ARM_CLIENT_SECRET }} --tenant ${{ secrets.TF_ARM_TENANT_ID }}
+                az vm deallocate --resource-group web-frontend --name bastion-host-vmLinux-0

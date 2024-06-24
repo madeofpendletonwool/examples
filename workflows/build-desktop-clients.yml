@@ -1,0 +1,117 @@
+name: Build Tauri Clients
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+jobs:
+  compile:
+    name: Compile
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macOS-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+
+    # Set an environment variable based on the OS
+    env:
+      DEPENDS_SETUP: ${{ matrix.os == 'ubuntu-latest' && 'true' || 'false' }}
+
+    steps:
+      - name: Set environment variables
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            echo "ARTIFACT_NAME1=deb/pinepods_${{ VERSION }}_amd64.deb" >> $GITHUB_ENV
+            echo "ARTIFACT_NAME2=appimage/pinepods_${{ VERSION }}_amd64.AppImage" >> $GITHUB_ENV
+          elif [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "ARTIFACT_NAME1=nsis/Pinepods_${{ VERSION }}_x64-setup.exe" >> $Env:GITHUB_ENV
+            echo "ARTIFACT_NAME2=msi/Pinepods_${{ VERSION }}_x64_en-US.msi" >> $Env:GITHUB_ENV
+          elif [ "${{ matrix.os }}" = "macOS-latest" ]; then
+            echo "ARTIFACT_NAME1=dmg/Pinepods_${{ VERSION }}_aarch64.dmg" >> $GITHUB_ENV
+            echo "ARTIFACT_NAME2=macos/Pinepods.app" >> $GITHUB_ENV
+          fi
+        shell: bash
+        if: ${{ matrix.os != 'windows-latest' }}
+
+      - name: Set environment variables (Windows)
+        run: |
+          if ("${{ matrix.os }}" -eq "windows-latest") {
+            echo "ARTIFACT_NAME1=nsis/Pinepods_${{ VERSION }}_x64-setup.exe" >> $Env:GITHUB_ENV
+            echo "ARTIFACT_NAME2=msi/Pinepods_${{ VERSION }}_x64_en-US.msi" >> $Env:GITHUB_ENV
+          }
+        shell: pwsh
+        if: ${{ matrix.os == 'windows-latest' }}
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Depends install
+        if: ${{ env.DEPENDS_SETUP == 'true' }}
+        run: |
+          sudo apt update
+          sudo apt install -qy libgtk-3-dev
+          sudo apt-get install -y libwebkit2gtk-4.0-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: wasm-addition
+        run: |
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install Trunk
+        run: |
+          cargo binstall trunk -y
+
+      - name: Install Tauri
+        run: |
+          cargo install tauri-cli --locked
+
+      - name: Build | Compile (UNIX)
+        run: |
+          cd web/src-tauri
+          cargo tauri build
+          pwd
+          ls
+          ls -la target/release/bundle
+        shell: bash
+        if: ${{ matrix.os != 'windows-latest' }}
+
+      - name: Build | Compile (Windows)
+        run: |
+          cd web/src-tauri
+          cargo tauri build
+          ls target/release/bundle
+        shell: pwsh
+        if: ${{ matrix.os == 'windows-latest' }}
+
+      - name: list bundles
+        run: |
+          ls -la web/src-tauri/target/release/bundle
+        shell: bash
+
+      - name: list mac bundles
+        run: |
+          ls -la web/src-tauri/target/release/bundle/macos
+          ls -la web/src-tauri/target/release/bundle/dmg
+        shell: bash
+        if: ${{ matrix.os == 'macOS-latest' }}
+
+      - name: Archive build 1
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.os }}-build
+          path: ./web/src-tauri/target/release/bundle/${{ env.ARTIFACT_NAME1 }}
+
+      - name: Archive build 2
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.os }}-build
+          path: ./web/src-tauri/target/release/bundle/${{ env.ARTIFACT_NAME2 }}
